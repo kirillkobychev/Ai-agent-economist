@@ -1,0 +1,9 @@
+transformers
+accelerate
+bitsandbytes
+sentencepiece
+safetensors
+pydantic
+python-docx
+huggingface_hub
+tzdata
