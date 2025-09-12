@@ -1,5 +1,5 @@
 import json
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Union
 from pydantic import BaseModel, Field
 from decimal import Decimal, ROUND_HALF_UP
 from datetime import datetime
@@ -22,6 +22,16 @@ ECONOMIST_LINE = "Утверждено экономистом ООО МИНЕР�
 # ===== СКИДКА ПО УМОЛЧАНИЮ (в процентах) =====
 DISCOUNT_PCT = 6.0  # На сколько уменьшаем цену реализации, %
 
+# ===== Корректировки по состояниям (чтобы Кондиция всегда была дороже) =====
+# Значения можно поменять под твои правила.
+COND_ADJUST_PCT = {
+    "Кондиция": 0.0,
+    "Некондиция 1 сорт": -2.0,
+    "Некондиция": -5.0,
+}
+# Порядок отображения строк при нескольких состояниях
+COND_ORDER = ["Кондиция", "Некондиция 1 сорт", "Некондиция"]
+
 # LLM модель (Meta Llama 3.1 8B Instruct)
 MODEL_ID = "meta-llama/Meta-Llama-3.1-8B-Instruct"
 
@@ -29,7 +39,11 @@ MODEL_ID = "meta-llama/Meta-Llama-3.1-8B-Instruct"
 class Item(BaseModel):
     nomenclature: str = Field(..., description="Например: 'ЛПН 3000х1200х10 ТУ (Серый, не грунт)'")
     sale_price_rub: float = Field(..., description="Цена реализации (число)")
-    condition: Optional[str] = Field(None, description="'Кондиция'|'Некондиция'|'Некондиция 1 сорт'|null")
+    # Может быть строка или список строк, если в одном тексте несколько состояний для одной номенклатуры
+    condition: Optional[Union[str, List[str]]] = Field(
+        None,
+        description="'Кондиция'|'Некондиция'|'Некондиция 1 сорт'|или список таких строк|null"
+    )
 
 class Extraction(BaseModel):
     items: List[Item]
@@ -53,9 +67,17 @@ model = AutoModelForCausalLM.from_pretrained(
 SYSTEM = (
     "Ты извлекаешь позиции из русских деловых сообщений. "
     "Верни СТРОГО JSON по схеме: "
-    '{"items":[{"nomenclature":"строка","sale_price_rub":число,"condition":"Кондиция|Некондиция|Некондиция 1 сорт|null"}]}. '
-    "Если несколько позиций — создай несколько объектов в items. "
-    "Если цена встречается несколько раз — возьми ПОСЛЕДНЮЮ. "
+    '{"items":[{"nomenclature":"строка","sale_price_rub":число,'
+    '"condition":"Кондиция|Некондиция|Некондиция 1 сорт|[строки]|null"}]}. '
+    "Если несколько НОМЕНКЛАТУР — создай несколько объектов в items. "
+    "Сопоставляй цену каждой номенклатуре по принципу БЛИЖАЙШЕГО ЧИСЛА-ЦЕНЫ, встречающегося рядом справа, "
+    "после двоеточия или в той же фразе/строке. "
+    "Если для ОДНОЙ номенклатуры указаны НЕСКОЛЬКО СОСТОЯНИЙ (например Кондиция, Некондиция, Некондиция 1 сорт): "
+    "— и есть НЕСКОЛЬКО ЦЕН рядом: создай ОТДЕЛЬНЫЕ объекты в items с соответствующими ценами; "
+    "при сопоставлении более ВЫСОКАЯ цена относится к 'Кондиция', более НИЗКАЯ — к 'Некондиция'. "
+    "— если указана ОДНА цена на все состояния: верни одно items-значение с 'condition' как МАССИВ строк, "
+    "например: \"condition\":[\"Кондиция\",\"Некондиция\"] (цены будут одинаковые до дальнейшей пост-обработки). "
+    "Если цена встречается несколько раз — возьми ПОСЛЕДНЮЮ, находящуюся ближе всего к номенклатуре. "
     "Размеры могут быть вида 3000х1200х10 (русская 'х'). "
     "Стандарты: ГОСТ или ТУ. "
     "Если в сообщении встречаются дополнительные характеристики в скобках (например 'Серый, не грунт'), "
@@ -127,8 +149,12 @@ def normalize_condition(cond: Optional[str]) -> str:
         return "Некондиция"
     if "кондиц" in t:
         return "Кондиция"
-    # если что-то экзотическое пришло — тоже считаем кондицией (по твоему правилу)
     return "Кондиция"
+
+def adjust_sale_price_by_condition(base_price: Decimal, cond: str) -> Decimal:
+    """Применяем корректировку к базовой цене по состоянию, чтобы Кондиция была дороже."""
+    adj_pct = Decimal(str(COND_ADJUST_PCT.get(cond, 0.0)))
+    return base_price * (Decimal("1.0") + adj_pct / Decimal("100"))
 
 # ===== Документы =====
 def make_docx_single(nomenclature: str, condition: Optional[str], transfer_price: Decimal) -> Path:
@@ -230,16 +256,44 @@ def make_docx_multi(rows: List[Tuple[str, Optional[str], Decimal]]) -> Path:
     doc.save(out)
     return out
 
-# ===== Логика объединения =====
-def decide_combine_from_text(text: str) -> Optional[bool]:
-    """Явные указания в тексте: вернуть True/False; иначе None."""
-    t = text.lower()
-    combine_words = ["в один документ", "одним документом", "объедини", "объединить", "один файл"]
-    split_words = ["отдельными файлами", "каждую отдельно", "каждый отдельно", "по отдельности", "раздельно"]
-    if any(w in t for w in combine_words): return True
-    if any(w in t for w in split_words): return False
-    return None
+# ===== Разворачивание Item в строки =====
+def expand_rows_for_item(it: Item, discount_pct: float) -> List[Tuple[str, Optional[str], Decimal]]:
+    """
+    Превращает один Item (с condition-строкой или списком) в одну или несколько строк для таблицы.
+    Если condition — список (и была одна базовая цена), применяем корректировки COND_ADJUST_PCT,
+    чтобы 'Кондиция' была дороже.
+    """
+    base_price = Decimal(str(it.sale_price_rub))
+    rows: List[Tuple[str, Optional[str], Decimal]] = []
 
+    # Приводим условия к списку
+    if it.condition is None or (isinstance(it.condition, str) and not it.condition.strip()):
+        conds = ["Кондиция"]
+    elif isinstance(it.condition, str):
+        conds = [it.condition]
+    else:
+        conds = it.condition if it.condition else ["Кондиция"]
+
+    # Нормализуем и сортируем по желаемому порядку
+    norm_conds = [normalize_condition(c) for c in conds]
+    norm_conds = sorted(norm_conds, key=lambda c: COND_ORDER.index(c) if c in COND_ORDER else 999)
+
+    # Если список условий (значит LLM дала одну базовую цену на все) — подправляем базовую цену по состояниям
+    multiple_conditions = len(norm_conds) > 1
+
+    for cond in norm_conds:
+        effective_sale_price = base_price
+        if multiple_conditions:
+            # применяем корректировку только когда условий несколько и цена одна
+            effective_sale_price = adjust_sale_price_by_condition(base_price, cond)
+        # считаем трансфертную цену
+        k = Decimal(str(1 - discount_pct/100.0))
+        transfer = (effective_sale_price * k)
+        rows.append((it.nomenclature, cond, transfer))
+
+    return rows
+
+# ===== Запуск =====
 def run_agent(raw_text: str, discount_pct: Optional[float] = None,
               combine: Optional[bool] = None, max_new_tokens: int = 512) -> List[str]:
     # берём скидку из аргумента, а если не передали — из константы DISCOUNT_PCT
@@ -250,27 +304,18 @@ def run_agent(raw_text: str, discount_pct: Optional[float] = None,
     created: List[str] = []
     rows: List[Tuple[str, Optional[str], Decimal]] = []
 
-    # 1) приоритет — явные флаги; 2) затем слова в тексте; 3) если ничего — комбинируем только если позиций > 1
-    text_decision = decide_combine_from_text(raw_text)
+    # По умолчанию: если позиций > 1 — объединяем в один документ.
     if combine is None:
-        if text_decision is not None:
-            combine = text_decision
-        else:
-            combine = len(result.items) > 1
+        combine = len(result.items) > 1
 
     for it in result.items:
-        price = Decimal(str(it.sale_price_rub))
-        k = Decimal(str(1 - discount_pct/100.0))
-        transfer = price * k
-        name = it.nomenclature  # полная номенклатура (с доп. скобками, если были)
-        cond = normalize_condition(it.condition)
-
-        if combine:
-            rows.append((name, cond, transfer))
-        else:
-            path = make_docx_single(name, cond, transfer)
-            print("Создан файл:", path)
-            created.append(str(path))
+        for name, cond, transfer in expand_rows_for_item(it, discount_pct):
+            if combine:
+                rows.append((name, cond, transfer))
+            else:
+                path = make_docx_single(name, cond, transfer)
+                print("Создан файл:", path)
+                created.append(str(path))
 
     if combine and rows:
         path = make_docx_multi(rows)
@@ -285,17 +330,10 @@ if __name__ == "__main__":
     p.add_argument("--text", type=str, required=True, help="вставь текст сообщений (можно с несколькими позициями)")
     p.add_argument("--discount", type=float, default=None, help="скидка в % (если не указана — берётся DISCOUNT_PCT)")
     p.add_argument("--max_new_tokens", type=int, default=512, help="лимит генерации для LLM")
-    p.add_argument("--combine", action="store_true", help="все позиции одним документом")
-    p.add_argument("--split", action="store_true", help="каждую позицию в отдельный документ")
+    p.add_argument("--split", action="store_true", help="каждую позицию в отдельный документ (по умолчанию — объединяем при >1)")
     args = p.parse_args()
 
-    if args.combine and args.split:
-        print("Выбери что-то одно: --combine или --split")
-        raise SystemExit(1)
-
-    combine_flag = args.combine if (args.combine or args.split) else None
-    if args.split:
-        combine_flag = False
+    combine_flag = not args.split  # по умолчанию True; --split ставит False
 
     run_agent(
         args.text,
