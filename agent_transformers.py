@@ -13,33 +13,26 @@ from docx.shared import Pt
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.enum.table import WD_TABLE_ALIGNMENT, WD_ALIGN_VERTICAL
 
-# ===== Настройки =====
 TIMEZONE = "Europe/Moscow"
 OUT_DIR = Path("out"); OUT_DIR.mkdir(exist_ok=True)
 DOC_TITLE = "Документ установки трансфертного ценообразования\n\nмежду ООО Фибратек и ООО МИНЕРАЛ КОМПОЗИТ"
 ECONOMIST_LINE = "Утверждено экономистом ООО МИНЕРАЛ КОМПОЗИТ"
 
-# ===== СКИДКА ПО УМОЛЧАНИЮ (в процентах) =====
-DISCOUNT_PCT = 6.0  # На сколько уменьшаем цену реализации, %
+DISCOUNT_PCT = 12.0
 
-# ===== Корректировки по состояниям (чтобы Кондиция всегда была дороже) =====
-# Значения можно поменять под твои правила.
 COND_ADJUST_PCT = {
     "Кондиция": 0.0,
     "Некондиция 1 сорт": -2.0,
     "Некондиция": -5.0,
 }
-# Порядок отображения строк при нескольких состояниях
+
 COND_ORDER = ["Кондиция", "Некондиция 1 сорт", "Некондиция"]
 
-# LLM модель (Meta Llama 3.1 8B Instruct)
 MODEL_ID = "meta-llama/Meta-Llama-3.1-8B-Instruct"
 
-# ===== Схема JSON из LLM =====
 class Item(BaseModel):
     nomenclature: str = Field(..., description="Например: 'ЛПН 3000х1200х10 ТУ (Серый, не грунт)'")
     sale_price_rub: float = Field(..., description="Цена реализации (число)")
-    # Может быть строка или список строк, если в одном тексте несколько состояний для одной номенклатуры
     condition: Optional[Union[str, List[str]]] = Field(
         None,
         description="'Кондиция'|'Некондиция'|'Некондиция 1 сорт'|или список таких строк|null"
@@ -48,7 +41,6 @@ class Item(BaseModel):
 class Extraction(BaseModel):
     items: List[Item]
 
-# ===== LLM: 4-битная загрузка (bitsandbytes) =====
 bnb = BitsAndBytesConfig(
     load_in_4bit=True,
     bnb_4bit_use_double_quant=True,
@@ -139,7 +131,6 @@ def now_date_str() -> str:
     return now.strftime("%d.%m.%Y")
 
 def normalize_condition(cond: Optional[str]) -> str:
-    """По умолчанию — Кондиция. Нормализуем разные варианты записи."""
     if not cond or not str(cond).strip():
         return "Кондиция"
     t = str(cond).strip().lower()
@@ -152,7 +143,6 @@ def normalize_condition(cond: Optional[str]) -> str:
     return "Кондиция"
 
 def adjust_sale_price_by_condition(base_price: Decimal, cond: str) -> Decimal:
-    """Применяем корректировку к базовой цене по состоянию, чтобы Кондиция была дороже."""
     adj_pct = Decimal(str(COND_ADJUST_PCT.get(cond, 0.0)))
     return base_price * (Decimal("1.0") + adj_pct / Decimal("100"))
 
@@ -190,18 +180,15 @@ def make_docx_single(nomenclature: str, condition: Optional[str], transfer_price
 
     doc.add_paragraph(""); doc.add_paragraph("")
 
-    # Утверждение (слева)
     p3 = doc.add_paragraph(ECONOMIST_LINE)
     p3.alignment = WD_ALIGN_PARAGRAPH.LEFT
     for r in p3.runs: r.font.size = Pt(12)
 
-    # Дата (слева)
     today = now_date_str()
     p4 = doc.add_paragraph(f"Дата\t\t\t\t\t\t\t\t{today}")
     p4.alignment = WD_ALIGN_PARAGRAPH.LEFT
     for r in p4.runs: r.font.size = Pt(12)
 
-    # Имя файла: полная номенклатура + дата
     out_name = safe_filename(f"{nomenclature} {today}.docx")
     out = OUT_DIR / out_name
     doc.save(out)
@@ -240,23 +227,19 @@ def make_docx_multi(rows: List[Tuple[str, Optional[str], Decimal]]) -> Path:
 
     doc.add_paragraph(""); doc.add_paragraph("")
 
-    # Утверждение (слева)
     p3 = doc.add_paragraph(ECONOMIST_LINE)
     p3.alignment = WD_ALIGN_PARAGRAPH.LEFT
     for r in p3.runs: r.font.size = Pt(12)
 
-    # Дата (слева)
     today = now_date_str()
     p4 = doc.add_paragraph(f"Дата\t\t\t\t\t\t\t\t{today}")
     p4.alignment = WD_ALIGN_PARAGRAPH.LEFT
     for r in p4.runs: r.font.size = Pt(12)
 
-    # Имя файла: Трансфертные цены {дата}.docx
     out = OUT_DIR / f"Трансфертные цены {today}.docx"
     doc.save(out)
     return out
 
-# ===== Разворачивание Item в строки =====
 def expand_rows_for_item(it: Item, discount_pct: float) -> List[Tuple[str, Optional[str], Decimal]]:
     """
     Превращает один Item (с condition-строкой или списком) в одну или несколько строк для таблицы.
@@ -266,7 +249,6 @@ def expand_rows_for_item(it: Item, discount_pct: float) -> List[Tuple[str, Optio
     base_price = Decimal(str(it.sale_price_rub))
     rows: List[Tuple[str, Optional[str], Decimal]] = []
 
-    # Приводим условия к списку
     if it.condition is None or (isinstance(it.condition, str) and not it.condition.strip()):
         conds = ["Кондиция"]
     elif isinstance(it.condition, str):
@@ -274,29 +256,23 @@ def expand_rows_for_item(it: Item, discount_pct: float) -> List[Tuple[str, Optio
     else:
         conds = it.condition if it.condition else ["Кондиция"]
 
-    # Нормализуем и сортируем по желаемому порядку
     norm_conds = [normalize_condition(c) for c in conds]
     norm_conds = sorted(norm_conds, key=lambda c: COND_ORDER.index(c) if c in COND_ORDER else 999)
 
-    # Если список условий (значит LLM дала одну базовую цену на все) — подправляем базовую цену по состояниям
     multiple_conditions = len(norm_conds) > 1
 
     for cond in norm_conds:
         effective_sale_price = base_price
         if multiple_conditions:
-            # применяем корректировку только когда условий несколько и цена одна
             effective_sale_price = adjust_sale_price_by_condition(base_price, cond)
-        # считаем трансфертную цену
         k = Decimal(str(1 - discount_pct/100.0))
         transfer = (effective_sale_price * k)
         rows.append((it.nomenclature, cond, transfer))
 
     return rows
 
-# ===== Запуск =====
 def run_agent(raw_text: str, discount_pct: Optional[float] = None,
               combine: Optional[bool] = None, max_new_tokens: int = 512) -> List[str]:
-    # берём скидку из аргумента, а если не передали — из константы DISCOUNT_PCT
     if discount_pct is None:
         discount_pct = DISCOUNT_PCT
 
@@ -304,7 +280,6 @@ def run_agent(raw_text: str, discount_pct: Optional[float] = None,
     created: List[str] = []
     rows: List[Tuple[str, Optional[str], Decimal]] = []
 
-    # По умолчанию: если позиций > 1 — объединяем в один документ.
     if combine is None:
         combine = len(result.items) > 1
 
@@ -333,7 +308,7 @@ if __name__ == "__main__":
     p.add_argument("--split", action="store_true", help="каждую позицию в отдельный документ (по умолчанию — объединяем при >1)")
     args = p.parse_args()
 
-    combine_flag = not args.split  # по умолчанию True; --split ставит False
+    combine_flag = not args.split
 
     run_agent(
         args.text,
