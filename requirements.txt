@@ -7,3 +7,6 @@ pydantic
 python-docx
 huggingface_hub
 tzdata
+pandas
+numpy
+openpyxl
