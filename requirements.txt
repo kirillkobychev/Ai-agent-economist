@@ -10,3 +10,5 @@ tzdata
 pandas
 numpy
 openpyxl
+scikit-learn
+joblib
