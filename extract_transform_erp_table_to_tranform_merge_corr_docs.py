@@ -30,18 +30,17 @@ class CorrDocsByNomenclatureToExcel:
         "Распределение расходов",
     )
 
-    # Корреспонденции
+    # Корреспонденции (префиксами)
     revenue_debit_prefix: str = "62.01"
     revenue_credit_prefix: str = "90.01.1"
 
+    # НДС: 90.03 -> 68.02 / 19.*
     vat_debit_prefix: str = "90.03"
-    vat_credit_prefix: str = "68.02"
+    vat_credit_prefixes: Tuple[str, ...] = ("68.02", "19.")
 
+    # Себестоимость: 90.02.1 -> 41.* / 45.*
     cogs_debit_prefix: str = "90.02.1"
-    cogs_credit_prefixes: Tuple[str, ...] = ("41.", "45.")  # 41.* и 45.*
-
-    # ставка НДС (выручка у тебя уже без НДС)
-    vat_rate: float = 0.20
+    cogs_credit_prefixes: Tuple[str, ...] = ("41.", "45.")
 
     # Признаки аналитик
     inv_group_re: re.Pattern = re.compile(r"^(43\*|41\*)\s*.*", flags=re.IGNORECASE)
@@ -53,24 +52,37 @@ class CorrDocsByNomenclatureToExcel:
     private_person_re: re.Pattern = re.compile(r"^Частное лицо$", flags=re.IGNORECASE)
     fio_re: re.Pattern = re.compile(r"^[А-ЯЁ][а-яё]+(?:\s+[А-ЯЁ][а-яё]+){2}$")
 
-    # CAPS-последовательности (ИНТЕРНЕТ РЕШЕНИЯ ГП, СТЕНА, etc.)
+    # CAPS-последовательности (ИНТЕРНЕТ РЕШЕНИЯ ГП / СТЕНА и т.п.)
     caps_seq_re: re.Pattern = re.compile(r"(?:[A-ZА-ЯЁ]{2,}(?:\s+[A-ZА-ЯЁ]{2,}){0,7})")
 
     # ---- Номенклатура: универсальные признаки ----
-    dim_re: re.Pattern = re.compile(r"\d+\s*(?:[xх\*/]\s*\d+){1,}", flags=re.IGNORECASE)
-    units_re: re.Pattern = re.compile(r"\b(кг|г|мм|см|м|л|ведро|нагрузка|ral)\b", flags=re.IGNORECASE)
+    dim_re: re.Pattern = re.compile(r"\d+\s*(?:[xх\*/]\s*\d+){1,}", flags=re.IGNORECASE)  # 1750*1130*5.2, 3000х1500х10
+    units_re: re.Pattern = re.compile(r"\b(кг|г|мм|см|м|л|ведро|нагрузка|ral|тн)\b", flags=re.IGNORECASE)
     has_digit_re: re.Pattern = re.compile(r"\d")
-    service_words_re: re.Pattern = re.compile(
-        r"(подразделение|основное подразделение|комиссионный|договор|основной договор)",
-        flags=re.IGNORECASE,
-    )
     acct_like_re: re.Pattern = re.compile(r"^\d{2}(\.\d{2}(\.\d+)?)?$")
 
-    # идентификатор документа
+    # "товарные" слова (помогает для "Минеральная черепица RIMROOF серая" и т.п.)
+    product_words_re: re.Pattern = re.compile(
+        r"\b("
+        r"черепица|краска|праймер|мастика|люк|лопата|грабли|дверка|духовка|лист|"
+        r"волна|планк|профиль|панель|плита|плитка|шпатель|кисть|саморез|гвоздь|"
+        r"пена|герметик|клей|шайба|болт|гайка|рулон|пленка|мембрана|уголок|"
+        r"решетка|кран|смеситель|фитинг|труба|бита|сверло|диск"
+        r")\b",
+        flags=re.IGNORECASE,
+    )
+
+    # латиница/бренд
+    latin_re: re.Pattern = re.compile(r"[A-Za-z]{3,}")
+
+    # документ: номер и "от dd.mm.yyyy"
     doc_num_re: re.Pattern = re.compile(r"\b(МК\d{2}-\d{6}|\d{8,})\b", flags=re.IGNORECASE)
     doc_ot_date_re: re.Pattern = re.compile(r"\bот\s+\d{2}\.\d{2}\.\d{4}\b", flags=re.IGNORECASE)
 
-    # ---------- utils ----------
+    # числовой допуск для "нулей"
+    eps: float = 1e-9
+
+    # ---------- базовые утилиты ----------
 
     @staticmethod
     def _to_amount(series: pd.Series) -> pd.Series:
@@ -103,17 +115,13 @@ class CorrDocsByNomenclatureToExcel:
         t = tok.strip()
         t = re.sub(r"^\d{1,2}\s*%\s*", "", t)  # убрать "20% "
         t = re.sub(r"\s{2,}", " ", t)
-        return t
+        return t.strip()
 
     def _startswith_any(self, s: pd.Series, prefixes: Tuple[str, ...]) -> pd.Series:
         out = pd.Series(False, index=s.index)
         for p in prefixes:
             out |= s.str.startswith(p, na=False)
         return out
-
-    @staticmethod
-    def _is_letter(ch: str) -> bool:
-        return bool(ch) and ch.isalpha()
 
     @staticmethod
     def _is_noise_token(tok: str) -> bool:
@@ -124,8 +132,6 @@ class CorrDocsByNomenclatureToExcel:
             return True
         if t.startswith("<") and t.endswith(">") and len(t) <= 10:
             return True
-        if t.upper() in {"NA", "N/A"}:
-            return True
         return False
 
     def _contains_doc_type(self, s: str) -> bool:
@@ -133,15 +139,10 @@ class CorrDocsByNomenclatureToExcel:
         return any(dt.upper() in u for dt in self.doc_types)
 
     def _looks_like_doc_header(self, s: str) -> bool:
-        # "Корректировка ... МК00-000079 от 13.10.2025 15:03:52"
-        if self._contains_doc_type(s) and self.doc_num_re.search(s) and self.doc_ot_date_re.search(s):
-            return True
-        # просто наличие "от dd.mm.yyyy" вместе с номером документа
-        if self.doc_num_re.search(s) and self.doc_ot_date_re.search(s):
-            return True
-        return False
+        t = str(s)
+        return bool(self._contains_doc_type(t) and self.doc_num_re.search(t) and self.doc_ot_date_re.search(t))
 
-    # ---------- doc column ----------
+    # ---------- поиск колонки документа ----------
 
     def _detect_doc_text_col(self, df: pd.DataFrame) -> str:
         doc_list = sorted(self.doc_types, key=len, reverse=True)
@@ -178,48 +179,49 @@ class CorrDocsByNomenclatureToExcel:
         if not t or self._is_noise_token(t):
             return -999
 
-        # ЖЁСТКИЙ запрет: если это заголовок документа или содержит тип документа — это не номенклатура
+        # запрет: заголовки документов / строки с типами документов
         if self._looks_like_doc_header(t) or self._contains_doc_type(t):
-            return -200
+            return -500
 
         u = t.upper()
         score = 0
 
         # сильные признаки
         if self.dim_re.search(t):
-            score += 8
+            score += 12
         if self.units_re.search(t):
-            score += 7
+            score += 10
         if self.has_digit_re.search(t) and re.search(r"[A-Za-zА-Яа-яЁё]", t):
-            score += 4
+            score += 6
+
+        # товарные слова (например "черепица ...")
+        if self.product_words_re.search(t):
+            score += 10
+
+        # латиница/бренд (RIMROOF, FIBRA ...)
+        if self.latin_re.search(t):
+            score += 8
+
+        # формат "описание товара"
         if any(ch in t for ch in ["(", ")", ",", ";", '"', "'"]):
             score += 2
-        if len(t) >= 18:
+        if len(t) >= 16:
+            score += 2
+        if len(t) >= 28:
             score += 2
 
-        for mark in [
-            "ЛИСТ", "ЛЮК", "КРАСК", "RIMROOF", "FIBRA", "PLANK",
-            "МАСТИКА", "ПРАЙМЕР", "ДУХОВК", "ЛОПАТ", "ГРАБЛ",
-            "АЛЬФАТЕХ", "ТЕХ", "НИКОЛЬ", "ГОСТ", "ТУ", "RAL"
-        ]:
-            if mark in u:
-                score += 1
-
         # штрафы
-        if u.startswith("СКЛАД") or u.startswith("ПЛОЩАДКА"):
-            score -= 20
-        if self.inv_group_re.match(t):
-            score -= 25
-        if self.service_words_re.search(t):
-            score -= 10
-        if self.counterparty_mark_re.search(t) or self.private_person_re.match(t) or self.fio_re.match(t):
-            score -= 10
-        if self.acct_like_re.match(t):
-            score -= 20
-
-        # если похоже на номер документа/метадату — тоже штраф
-        if self.doc_num_re.search(t) and self.doc_ot_date_re.search(t):
+        if u.startswith(("СКЛАД", "ПЛОЩАДКА")):
             score -= 50
+        if self.inv_group_re.match(t):
+            score -= 60
+        if self.counterparty_mark_re.search(t) or self.private_person_re.match(t) or self.fio_re.match(t):
+            score -= 25
+        if self.acct_like_re.match(t):
+            score -= 60
+
+        if any(w in u for w in ["ОСНОВНОЕ ПОДРАЗДЕЛЕНИЕ", "КОМИССИОННЫЙ", "ДОГОВОР"]):
+            score -= 20
 
         return score
 
@@ -227,10 +229,8 @@ class CorrDocsByNomenclatureToExcel:
         t = str(token).strip()
         if not t or self._is_noise_token(t):
             return -999
-
-        # заголовок документа не может быть контрагентом
         if self._looks_like_doc_header(t):
-            return -200
+            return -300
 
         u = t.upper()
         score = 0
@@ -254,6 +254,7 @@ class CorrDocsByNomenclatureToExcel:
                 elif ur >= 0.70:
                     score += 10
 
+        # бонус смешанного регистра + юрформа (ТехноНИКОЛЬ ... ООО)
         has_lower = bool(re.search(r"[a-zа-яё]", t))
         has_upper = bool(re.search(r"[A-ZА-ЯЁ]", t))
         if has_legal_form and has_lower and has_upper:
@@ -268,24 +269,16 @@ class CorrDocsByNomenclatureToExcel:
             score -= 12
         if self.inv_group_re.match(t):
             score -= 12
-        if self.service_words_re.search(t):
-            score -= 6
-        if ("ГОСТ" in u) or ("ТУ" in u) or self.dim_re.search(t):
+        if self.dim_re.search(t):
             score -= 6
         if self.acct_like_re.match(t):
             score -= 10
 
         return score
 
-    # ---------- counterparty subtokens ----------
-
     def _counterparty_subtokens(self, tok: str) -> List[str]:
-        if tok is None:
-            return []
         t = str(tok).strip()
-        if not t or self._is_noise_token(t):
-            return []
-        if self._looks_like_doc_header(t):
+        if not t or self._is_noise_token(t) or self._looks_like_doc_header(t):
             return []
 
         t_clean = re.sub(r'[\"“”<>]+', " ", t)
@@ -304,19 +297,11 @@ class CorrDocsByNomenclatureToExcel:
             cand = m.group(0).strip()
             if not cand:
                 continue
-
-            start, end = m.start(), m.end()
-            if start > 0 and self._is_letter(t_clean[start - 1]):
-                continue
-            if end < len(t_clean) and self._is_letter(t_clean[end]):
-                continue
-
             words = cand.split()
             if any(w in bad for w in words):
                 continue
             if len(words) == 1 and len(words[0]) < 4:
                 continue
-
             out.append(cand)
 
         out.append(t_clean)
@@ -356,15 +341,8 @@ class CorrDocsByNomenclatureToExcel:
                 warehouse = tok
                 continue
 
-            if "Основной договор" in tok:
-                parts = [p.strip() for p in tok.split(".") if p.strip()]
-                if parts:
-                    tail = parts[-1]
-                    if self.fio_re.match(tail):
-                        cp_candidates.append((self._score_counterparty(tail), tail))
-
             ns = self._score_nomenclature(tok)
-            if ns >= 6:  # порог поднял, чтобы документы/прочее не пролезали
+            if ns >= 8:
                 nomen_candidates.append((ns, self._normalize_nomenclature(tok)))
 
             for cand in self._counterparty_subtokens(tok):
@@ -382,7 +360,6 @@ class CorrDocsByNomenclatureToExcel:
             nomen_candidates.sort(key=lambda x: (-x[0], len(x[1])))
             nomen = nomen_candidates[0][1]
 
-        # финальная защита: если вдруг выбралось "похоже на документ" — убираем
         if nomen and (self._looks_like_doc_header(nomen) or self._contains_doc_type(nomen)):
             nomen = None
 
@@ -406,35 +383,31 @@ class CorrDocsByNomenclatureToExcel:
         doc_col = self._detect_doc_text_col(df)
         doc_text = df[doc_col].astype("string").str.strip()
 
+        # ДокументКлюч = полный текст документа (с хвостом "от ... ...")
+        df["ДокументКлюч"] = doc_text
+
         header_re = self._doc_header_re()
         hdr = doc_text.str.extract(header_re)
 
-        df["ДокументКлюч"] = np.where(
-            hdr["dt"].notna() & hdr["num"].notna() & hdr["d"].notna() & hdr["t"].notna(),
-            hdr["dt"].astype("string").str.strip()
-            + " " + hdr["num"].astype("string").str.strip()
-            + " от " + hdr["d"].astype("string").str.strip()
-            + " " + hdr["t"].astype("string").str.strip(),
-            doc_text,
-        )
-
+        # Берём только строки по нашим типам документов
         df_docs = df[hdr["dt"].notna()].copy()
         if df_docs.empty:
             raise ValueError("Не найдено строк с нужными документами (doc_types).")
 
+        # ---- суммы по корреспонденциям ----
         amt = self._to_amount(df_docs[self.amount_col])
         debit = df_docs[self.debit_col]
         credit = df_docs[self.credit_col]
 
         is_rev = debit.str.startswith(self.revenue_debit_prefix, na=False) & credit.str.startswith(self.revenue_credit_prefix, na=False)
-        is_vat = debit.str.startswith(self.vat_debit_prefix, na=False) & credit.str.startswith(self.vat_credit_prefix, na=False)
+        is_vat = debit.str.startswith(self.vat_debit_prefix, na=False) & self._startswith_any(credit, self.vat_credit_prefixes)
         is_cogs = debit.str.startswith(self.cogs_debit_prefix, na=False) & self._startswith_any(credit, self.cogs_credit_prefixes)
 
         df_docs["__Выручка"] = np.where(is_rev.to_numpy(), amt.to_numpy(), 0.0)
         df_docs["__НДС_raw"] = np.where(is_vat.to_numpy(), amt.to_numpy(), 0.0)
         df_docs["__Себестоимость_raw"] = np.where(is_cogs.to_numpy(), amt.to_numpy(), 0.0)
 
-        # оставляем документы, где есть что-то по интересующим корреспонденциям
+        # фильтр документов: оставляем только те, где есть хоть одна из трёх сумм
         doc_tot = df_docs.groupby("ДокументКлюч", as_index=False)[["__Выручка", "__НДС_raw", "__Себестоимость_raw"]].sum()
         keep = set(
             doc_tot[
@@ -445,8 +418,8 @@ class CorrDocsByNomenclatureToExcel:
         )
         df_docs = df_docs[df_docs["ДокументКлюч"].isin(keep)].copy()
 
-        # --- аналитики ---
-        # ВАЖНО: doc_col исключаем из scan_cols, иначе заголовки документов попадут в номенклатуру
+        # ---- извлечение аналитик ----
+        # важно: НЕ сканируем doc_col, иначе заголовок документа лезет в номенклатуру
         exclude_scan = {
             self.debit_col, self.credit_col, self.amount_col, "_row_id",
             "__Выручка", "__НДС_raw", "__Себестоимость_raw",
@@ -457,7 +430,7 @@ class CorrDocsByNomenclatureToExcel:
         fields = df_docs.apply(lambda r: self._extract_row_fields(r, scan_cols), axis=1, result_type="expand")
         df_docs = pd.concat([df_docs, fields], axis=1)
 
-        # doc-level инфо
+        # doc-level аналитика (первое непустое)
         doc_info_cols = ["Площадка", "Контрагент", "Готовая продукция/Товары", "Склад"]
         if self.date_col in df_docs.columns:
             doc_info_cols = [self.date_col] + doc_info_cols
@@ -472,11 +445,10 @@ class CorrDocsByNomenclatureToExcel:
         else:
             doc_info["Дата"] = pd.NA
 
-        # номенклатурный ключ
+        # ---- группируем по ДокументКлюч + Номенклатура ----
         df_docs["__nom_key"] = df_docs["Номенклатура"].astype("string")
         df_docs["__nom_key"] = df_docs["__nom_key"].where(df_docs["__nom_key"].notna(), other="__NO_NOM__")
 
-        # агрегируем документ+номенклатура
         agg = (
             df_docs.groupby(["ДокументКлюч", "__nom_key"], as_index=False)
             .agg({
@@ -491,6 +463,7 @@ class CorrDocsByNomenclatureToExcel:
                 self.date_col: self._pick_first_non_empty if self.date_col in df_docs.columns else "first",
             })
         )
+
         if self.date_col in agg.columns:
             agg = agg.rename(columns={self.date_col: "Дата"})
         else:
@@ -509,79 +482,37 @@ class CorrDocsByNomenclatureToExcel:
                 agg[col] = agg[col].fillna(agg[dc])
                 agg = agg.drop(columns=[dc])
 
-        # ----------------- ВЫРУЧКА -----------------
+        # ---- Выручка ----
         agg["Выручка"] = pd.to_numeric(agg["__Выручка"], errors="coerce").fillna(0.0)
 
-        # ----------------- НДС: строго по ДокументКлюч -----------------
-        # 1) НДС учитываем ТОЛЬКО если есть НДС-проводки 90.03->68.02 в документе
-        vat_raw_by_doc = (
-            df_docs.groupby("ДокументКлюч")["__НДС_raw"]
-            .sum()
-            .astype(float)
-        )
+        # ---- НДС: суммарно по ДокументКлюч и распределяем по выручке внутри ДокументКлюч ----
+        vat_total_by_doc = df_docs.groupby("ДокументКлюч")["__НДС_raw"].sum().astype(float)
 
-        # 2) Выручка_итого по документу (для пересчёта НДС)
-        rev_by_doc = (
-            agg.groupby("ДокументКлюч")["Выручка"]
-            .sum()
-            .astype(float)
-        )
+        rev = agg["Выручка"].astype(float).fillna(0.0)
+        rev_abs = rev.abs()
+        agg["_rev_abs_w"] = np.where(rev != 0.0, rev_abs, 0.0)
+        denom = agg.groupby("ДокументКлюч")["_rev_abs_w"].transform("sum").astype(float)
 
-        # 3) НДС_итого по документу:
-        #    - если НДС-проводки есть и выручка != 0: НДС = Выручка * 0.20
-        #    - если НДС-проводки есть и выручка == 0: НДС = сумма НДС-проводок
-        #    - если НДС-проводок нет: НДС = 0
-        vat_present = (vat_raw_by_doc != 0.0)
-
-        vat_total_by_doc = pd.Series(0.0, index=rev_by_doc.index)
-        # выравниваем индексы
-        vat_raw_by_doc = vat_raw_by_doc.reindex(vat_total_by_doc.index, fill_value=0.0)
-        vat_present = vat_present.reindex(vat_total_by_doc.index, fill_value=False)
-
-        for k in vat_total_by_doc.index:
-            if not bool(vat_present.loc[k]):
-                vat_total_by_doc.loc[k] = 0.0
-                continue
-            rv = float(rev_by_doc.loc[k])
-            if rv != 0.0:
-                vat_total_by_doc.loc[k] = rv * float(self.vat_rate)
-            else:
-                vat_total_by_doc.loc[k] = float(vat_raw_by_doc.loc[k])
-
-        # 4) ВЕСА распределения НДС:
-        #    распределяем только по строкам, где есть выручка (иначе нулевая строка получит НДС)
-        rev_row = agg["Выручка"].astype(float).fillna(0.0)
-        rev_row_abs = rev_row.abs()
-
-        # сумма abs-выручки по документу только по выручечным строкам (rev!=0)
-        denom = (
-            agg.assign(_rev_abs=rev_row_abs, _is_rev=(rev_row != 0.0))
-            .groupby("ДокументКлюч")
-            .apply(lambda g: float(g.loc[g["_is_rev"], "_rev_abs"].sum()))
-        )
-        denom = denom.reindex(agg["ДокументКлюч"].unique(), fill_value=0.0)
-
-        # веса
-        doc_key_series = agg["ДокументКлюч"]
-        denom_per_row = doc_key_series.map(denom).astype(float).fillna(0.0)
-        vat_total_per_row = doc_key_series.map(vat_total_by_doc).astype(float).fillna(0.0)
-
-        weight = np.where(
-            (rev_row != 0.0) & (denom_per_row.to_numpy() != 0.0),
-            rev_row_abs.to_numpy() / denom_per_row.to_numpy(),
-            0.0
-        )
-
-        # если в документе НДС есть, но выручечных строк нет (редко) — распределим поровну по строкам документа
-        no_rev_rows_doc = doc_key_series.map(denom).fillna(0.0).to_numpy() == 0.0
-        if np.any(no_rev_rows_doc):
-            cnt_rows = agg.groupby("ДокументКлюч")["__nom_key"].transform("count").astype(float).to_numpy()
-            weight = np.where(no_rev_rows_doc, 1.0 / np.maximum(cnt_rows, 1.0), weight)
-
+        vat_total_per_row = agg["ДокументКлюч"].map(vat_total_by_doc).astype(float).fillna(0.0)
+        weight = np.where(denom.to_numpy() != 0.0, agg["_rev_abs_w"].to_numpy() / denom.to_numpy(), 0.0)
         agg["НДС"] = vat_total_per_row.to_numpy() * weight
 
-        # ----------------- Себестоимость -----------------
-        # ВАЖНО: НЕ распределяем. Если номенклатуру не нашли — себестоимость 0.
+        # если НДС есть, а выручки нет — кладём НДС в строку "__NO_NOM__" (или в первую строку документа)
+        docs_no_rev = agg.loc[(denom == 0.0), "ДокументКлюч"].unique().tolist()
+        if docs_no_rev:
+            for dk in docs_no_rev:
+                vat_val = float(vat_total_by_doc.get(dk, 0.0))
+                if abs(vat_val) <= self.eps:
+                    continue
+                sub_idx = agg.index[agg["ДокументКлюч"] == dk].tolist()
+                if not sub_idx:
+                    continue
+                idx_no_nom = agg.index[(agg["ДокументКлюч"] == dk) & (agg["__nom_key"] == "__NO_NOM__")].tolist()
+                target_idx = idx_no_nom[0] if idx_no_nom else sub_idx[0]
+                agg.loc[agg["ДокументКлюч"] == dk, "НДС"] = 0.0
+                agg.loc[target_idx, "НДС"] = vat_val
+
+        # ---- Себестоимость: НЕ распределяем. Если номенклатура не распознана — 0 ----
         is_real_nom = (agg["__nom_key"] != "__NO_NOM__")
         agg["Себестоимость"] = np.where(
             is_real_nom.to_numpy(),
@@ -589,11 +520,14 @@ class CorrDocsByNomenclatureToExcel:
             0.0
         )
 
-        # ----------------- Финальные правки -----------------
-        # если вдруг номенклатура пустая, но выручка есть — оставим "Без номенклатуры"
+        agg = agg.drop(columns=["_rev_abs_w"], errors="ignore")
+
+        # ---- Заглушки ----
+        # номенклатуру оставляем как "Без номенклатуры", НО потом выкинем строки с нулями
         agg["Номенклатура"] = agg["Номенклатура"].fillna("Без номенклатуры")
         agg["Контрагент"] = agg["Контрагент"].fillna("Без контрагента")
 
+        # ---- итог ----
         out = agg[[
             "Дата",
             "ДокументКлюч",
@@ -610,6 +544,15 @@ class CorrDocsByNomenclatureToExcel:
         out["Дата"] = pd.to_datetime(out["Дата"], errors="coerce")
         for col in ["Выручка", "НДС", "Себестоимость"]:
             out[col] = pd.to_numeric(out[col], errors="coerce").fillna(0.0)
+
+        # ---------- ВОТ НУЖНАЯ ПРАВКА ----------
+        # Удаляем строки "Без номенклатуры", если по ним все суммы = 0
+        bn = out["Номенклатура"].astype("string").str.strip().eq("Без номенклатуры")
+        zeros = (out["Выручка"].abs() <= self.eps) & (out["НДС"].abs() <= self.eps) & (out["Себестоимость"].abs() <= self.eps)
+        drop_mask = bn & zeros
+        dropped = int(drop_mask.sum())
+        out = out[~drop_mask].copy()
+        # --------------------------------------
 
         # сохранить Excel
         with pd.ExcelWriter(self.output_excel_path, engine="openpyxl") as writer:
@@ -632,6 +575,7 @@ class CorrDocsByNomenclatureToExcel:
             "doc_col_used": doc_col,
             "rows_out": int(len(out)),
             "unique_docs": int(out["ДокументКлюч"].nunique()),
+            "dropped_zero_no_nom_rows": dropped,
         }
         return out, meta
 
@@ -648,6 +592,7 @@ def main():
     print("Колонка документа:", meta["doc_col_used"])
     print("Строк:", meta["rows_out"])
     print("Уникальных документов:", meta["unique_docs"])
+    print("Удалено строк 'Без номенклатуры' с нулями:", meta["dropped_zero_no_nom_rows"])
 
     print("\n=== Preview (первые 30 строк) ===")
     with pd.option_context("display.max_columns", 25, "display.width", 240):
