@@ -12,3 +12,4 @@ numpy
 openpyxl
 scikit-learn
 joblib
+catboost
