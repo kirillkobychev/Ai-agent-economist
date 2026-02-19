@@ -303,7 +303,7 @@ if __name__ == "__main__":
     import argparse
     p = argparse.ArgumentParser()
     p.add_argument("--text", type=str, required=True, help="вставь текст сообщений (можно с несколькими позициями)")
-    p.add_argument("--discount", type=float, default=None, help="скидка в % (если не указана — берётся DISCOUNT_PCT)")
+    p.add_argument("--discount", type=float, default=None, help="скидка в процентах (если не указана — берётся DISCOUNT_PCT)")
     p.add_argument("--max_new_tokens", type=int, default=512, help="лимит генерации для LLM")
     p.add_argument("--split", action="store_true", help="каждую позицию в отдельный документ (по умолчанию — объединяем при >1)")
     args = p.parse_args()
